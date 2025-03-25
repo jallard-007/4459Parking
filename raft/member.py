@@ -1,26 +1,38 @@
-import asyncio
+import math
+import queue
 import random
+import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
-from typing import Dict, Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Any, Dict, List, Literal, Optional, Protocol, Set, Tuple
 
 import grpc
 
-import raft_pb2
-import raft_pb2_grpc
-from state import LeaderState, PersistentState
+from raft import raft_pb2, raft_pb2_grpc
+from raft.state import LeaderState, PersistentState
 
 
-class Member(raft_pb2_grpc.RaftServicer):
+class ElectionData:
+    def __init__(self, election_term: int):
+        self.election_term = election_term
+        self.votes_received = 0
+        self.voters: Set[int] = set()
+
+
+class FSM(Protocol):
+    def apply(self, command: str) -> None:
+        ...
+
+
+class Member:
     def __init__(
         self,
         id: int,
         state: PersistentState,
         members: Dict[int, str],
-        timeout_min_ms: int = 200,
-        timeout_max_ms: int = 400,
+        timeout_min_ms: int = 300,
+        timeout_max_ms: int = 450,
     ):
-
         self.id = id
 
         # self.state = PersistentState(
@@ -31,13 +43,9 @@ class Member(raft_pb2_grpc.RaftServicer):
 
         self.timeout_min_ms = timeout_min_ms
         self.timeout_max_ms = timeout_max_ms
-        self.timeout_task: Optional[asyncio.Task] = None
+        self.timeout_task: Optional[threading.Timer] = None
 
-        self.term_lock = asyncio.Lock()
-        """Lock used for critical zones regrading the term and voted_for"""
-
-        self.log_lock = asyncio.Lock()
-        """Lock used for critical zones regrading the log"""
+        self._lock = threading.RLock()
 
         self.members: Dict[int, str] = members
         self.member_channels: Dict[int, grpc.Channel] = {}
@@ -45,8 +53,6 @@ class Member(raft_pb2_grpc.RaftServicer):
 
         self.leader_id: Optional[int] = None
         """ID of the current known leader"""
-        self._is_leader = asyncio.Event()
-        """Flag to mark if we are the leader"""
 
         """Volatile state on all servers (Reinitialized after election)"""
 
@@ -55,72 +61,102 @@ class Member(raft_pb2_grpc.RaftServicer):
         self.last_applied: int = 0
         """index of highest log entry applied to state machine (initialized to 0, increases monotonically)"""
 
-        self.leader_state: LeaderState = LeaderState()
+        self.leader_state = LeaderState()
         """State when this member is the leader"""
 
-        self.index_lock = asyncio.Lock()
-        """Lock for leader state index data"""
+        self._role: Literal["F", "C", "L"] = "F"
+        """The role of this member. F = follower, C = candidate, L = leader"""
 
-    def create_member_stubs(self) -> None:
-        for member_id, member_address in self.members.items():
-            if self.member_stubs.get(member_id) is not None:
-                continue
+        self._req_queue: queue.Queue[
+            Tuple[Optional[threading.Event], Any]
+        ] = queue.Queue()
 
-            channel = self.member_channels.get(member_id)
-            if channel is None:
-                channel = grpc.aio.insecure_channel(member_address)
-                self.member_channels[member_id] = channel
+        self._event_to_append_response: Dict[
+            threading.Event, Optional[raft_pb2.AppendEntriesResponse]
+        ] = {}
+        self._event_to_vote_response: Dict[
+            threading.Event, Optional[raft_pb2.RequestVoteResponse]
+        ] = {}
+        self._event_to_append_log_status: Dict[threading.Event, Optional[bool]] = {}
 
-            self.member_stubs[member_id] = raft_pb2_grpc.RaftStub(channel)
+    # region api for user server
 
-    async def AppendEntries(
-        self, request: raft_pb2.AppendEntriesRequest, context: grpc.ServicerContext
+    def append_log(self, command: str) -> bool:
+        """Returns True if the command was applied to the FSM"""
+        event = threading.Event()
+        self._req_queue.put((event, command))
+        self._event_to_append_log_status[event] = None
+        event.wait()
+        res = self._event_to_append_log_status.pop(event)
+        assert res is not None
+        return res
+
+    # endregion
+
+    # region api for raft servicer
+
+    def process_append_entries_request(
+        self, request: raft_pb2.AppendEntriesRequest
     ) -> raft_pb2.AppendEntriesResponse:
-        return await self.handle_append_entries_request(request, context)
+        event = threading.Event()
+        self._req_queue.put((event, request))
+        self._event_to_append_response[event] = None
+        event.wait()
+        res = self._event_to_append_response.pop(event)
+        assert res is not None
+        return res
 
-    async def RequestVote(
-        self, request: raft_pb2.RequestVoteRequest, context: grpc.ServicerContext
+    def process_request_vote_request(
+        self, request: raft_pb2.AppendEntriesRequest
     ) -> raft_pb2.RequestVoteResponse:
-        return await self.handle_request_vote_request(request, context)
+        event = threading.Event()
+        self._req_queue.put((event, request))
+        self._event_to_vote_response[event] = None
+        event.wait()
+        res = self._event_to_vote_response.pop(event)
+        assert res is not None
+        return res
 
-    async def handle_append_entries_request(
-        self, request: raft_pb2.AppendEntriesRequest, context: grpc.ServicerContext
+    # endregion
+
+    # region Base
+
+    def _handle_append_entries_request(
+        self, request: raft_pb2.AppendEntriesRequest
     ) -> raft_pb2.AppendEntriesResponse:
+        with self._lock:
+            # reply false if term < current_term
+            if request.term < self.state.current_term:
+                return raft_pb2.AppendEntriesResponse(
+                    term=self.state.current_term, success=False
+                )
 
-        # reply false if term < current_term
-        if request.term < self.state.current_term:
-            return raft_pb2.AppendEntriesResponse(
-                term=self.state.current_term, success=False
-            )
+            self._reset_timeout()
 
-        # if request.term == self.term and we are leader; this should not be possible.
-        # only the leader should be sending AppendEntries, and there can be only be one leader per term
-        if request.term == self.state.current_term:
-            assert self.leader_id != self.id
-        else:
-            # only other option is request.term > self.term
-            # in that case the leader has changed, if we are not already a follower, we need to become one
-            async with self.term_lock:
-                self.set_new_term(request.term, None, request.leader_id)
+            # if request.term == self.term and we are leader; this should not be possible.
+            # only the leader should be sending AppendEntries, and there can be only be one leader per term
+            if request.term == self.state.current_term:
+                assert self.leader_id != self.id
+            else:
+                # only other option is request.term > self.term
+                # in that case the leader has changed, if we are not already a follower, we need to become one
+                self._set_new_term(request.term, None, request.leader_id)
 
-        self.reset_timeout()
+            # reply false if log doesn't contain an entry at prev_log_index
+            # whose term matches prev_log_term
+            prev_log_index_log = self.state.get_log_at(request.prev_log_index)
+            if (
+                prev_log_index_log is None
+                or prev_log_index_log.term != request.prev_log_index
+            ):
+                return raft_pb2.AppendEntriesResponse(
+                    term=self.state.current_term, success=False
+                )
 
-        # reply false if log doesn't contain an entry at prev_log_index
-        # whose term matches prev_log_term
-        prev_log_index_log = self.state.get_log_at(request.prev_log_index)
-        if (
-            prev_log_index_log is None
-            or prev_log_index_log.term != request.prev_log_index
-        ):
-            return raft_pb2.AppendEntriesResponse(
-                term=self.state.current_term, success=False
-            )
-
-        # If an existing entry conflicts with a new one (same index
-        # but different terms), delete the existing entry and all that
-        # follow it
-        # Append any new entries not already in the log
-        async with self.log_lock:
+            # If an existing entry conflicts with a new one (same index
+            # but different terms), delete the existing entry and all that
+            # follow it
+            # Append any new entries not already in the log
             made_state_changes = False
             for entry in request.entries:
                 existing_log = self.state.get_log_at(entry.index)
@@ -136,24 +172,21 @@ class Member(raft_pb2_grpc.RaftServicer):
             if made_state_changes:
                 self.state.save()
 
-        # If leader_commit > commit_index, set commit_index =
-        # min(leader_commit, index of last new entry)
-        if request.leader_commit > self.commit_index:
-            self.commit_index = min(request.leader_commit, self.state.get_log_len())
+            # If leader_commit > commit_index, set commit_index =
+            # min(leader_commit, index of last new entry)
+            if request.leader_commit > self.commit_index:
+                self.commit_index = min(request.leader_commit, self.state.get_log_len())
 
-        # TODO: async apply/commit anything that can be
+            self._reset_timeout()
 
-        return raft_pb2.AppendEntriesResponse(
-            term=self.state.current_term, success=True
-        )
+            return raft_pb2.AppendEntriesResponse(
+                term=self.state.current_term, success=True
+            )
 
-    async def handle_request_vote_request(
-        self, request: raft_pb2.RequestVoteRequest, context: grpc.ServicerContext
+    def _handle_request_vote_request(
+        self, request: raft_pb2.RequestVoteRequest
     ) -> raft_pb2.RequestVoteResponse:
-
-        # critical zone
-        async with self.term_lock:
-
+        with self._lock:
             # Reply false if term < currentTerm
             if request.term < self.state.current_term:
                 return raft_pb2.RequestVoteResponse(
@@ -161,25 +194,28 @@ class Member(raft_pb2_grpc.RaftServicer):
                 )
 
             if request.term > self.state.current_term:
-                self.set_new_term(request.term, None)
+                self._set_new_term(request.term, None)
 
             # If votedFor is null or candidateId, and candidate's log is at
             # least as up-to-date as receiver's log, grant vote (§5.2, §5.4)
 
             vote_granted = False
             if self.state.voted_for is None:
-                candidate_log_up_to_date = self.check_if_candidate_log_is_up_to_date(
+                candidate_log_up_to_date = self._check_if_candidate_log_is_up_to_date(
                     request.last_log_index, request.last_log_term
                 )
 
                 if candidate_log_up_to_date:
-                    vote_granted = self.set_voted_for(request.candidate_id)
+                    vote_granted = self._set_voted_for(request.candidate_id)
+
+            if vote_granted:
+                self._reset_timeout()
 
             return raft_pb2.RequestVoteResponse(
                 term=self.state.current_term, vote_granted=vote_granted
             )
 
-    def check_if_candidate_log_is_up_to_date(
+    def _check_if_candidate_log_is_up_to_date(
         self, candidate_last_log_index: int, candidate_last_log_term: int
     ) -> bool:
         """Raft determines which of two logs is more up-to-date
@@ -195,69 +231,155 @@ class Member(raft_pb2_grpc.RaftServicer):
             and candidate_last_log_index >= last_log.index
         )
 
-    def set_voted_for(self, candidate_id: int):
-        self.state.set_voted_for(candidate_id)
+    # endregion
 
-    def reset_timeout(self) -> None:
-        if self.timeout_task and not self.timeout_task.done():
-            self.timeout_task.cancel()
+    # region Candidate
 
-        election_timeout_ms: int = random.randint(
-            self.timeout_min_ms, self.timeout_max_ms
-        )
-        self.timeout_task = asyncio.create_task(
-            self.timeout_handler(election_timeout_ms)
-        )
+    def _run_election(self) -> None:
+        election_data = ElectionData(self.state.current_term)
+        self._set_voted_for(self.id)
+        election_data.votes_received = 1  # we voted for ourself
 
-    async def timeout_handler(self, election_timeout_ms: int) -> None:
-        await asyncio.sleep(election_timeout_ms)
-        await self.start_election()
+        self._send_request_vote_to_members_and_handle_responses(election_data)
+        if election_data.votes_received >= self._get_quorum_val():
+            self._role = "L"
 
-    async def start_election(self) -> None:
-        """Starts an election"""
-        async with self.term_lock:
-            self.set_new_term(self.state.current_term + 1, self.id)
+    def _send_request_vote_to_members_and_handle_responses(self, election_data) -> None:
+        """This takes care of sending out the vote requests and counting them up"""
+        request = self._create_request_vote_request()
+        with ThreadPoolExecutor(len(self.members)) as t_pool:
+            futures = []
+            for member_id in self.members.keys():
+                if member_id == self.id:
+                    continue
 
-        # TODO: request vote to all neighbours
-        # Need to figure out the timeout part during election.
-
-        """
-        TODO:
-        When a leader first comes to power,
-        it initializes all nextIndex values to the index just after the
-        last one in its log (11 in Figure 7).
-        """
-
-    async def send_append_entries_to_followers(self, current_term: int) -> None:
-        while self._is_leader.is_set():
-            curr_time = time.perf_counter()
-            heartbeat_interval_sec = 0.1
-            next_time = curr_time + heartbeat_interval_sec
-
-            for member_id, next_index in self.leader_state.next_index.items():
-                append_entries_request = await self.create_append_entries_request(
-                    current_term, next_index
-                )
-                sent_index = next_index + len(append_entries_request.entries) - 1
-                asyncio.create_task(
-                    self.send_append_entries_and_handle_response(
+                futures.append(
+                    t_pool.submit(
+                        self._send_request_vote_request,
                         member_id,
-                        sent_index,
-                        append_entries_request,
+                        request,
                     )
                 )
 
-            await self.calculate_commit_index()
+            for future in as_completed(futures):
+                if result := future.result():
+                    member_id, response = result
+                    self._handle_request_vote_response(
+                        election_data, member_id, response
+                    )
 
-            await asyncio.sleep(max((next_time - time.perf_counter()), 0))
+    def _create_request_vote_request(self) -> raft_pb2.RequestVoteRequest:
+        last_log_index = 0
+        last_log_term = 0
 
-    async def create_append_entries_request(
+        if last_log := self.state.get_last_log():
+            last_log_index = last_log.index
+            last_log_term = last_log.term
+
+        return raft_pb2.RequestVoteRequest(
+            term=self.state.current_term,
+            candidate_id=self.id,
+            last_log_index=last_log_index,
+            last_log_term=last_log_term,
+        )
+
+    def _send_request_vote_request(
+        self,
+        member_id: int,
+        append_entries_request: raft_pb2.RequestVoteRequest,
+    ) -> Optional[Tuple[int, raft_pb2.RequestVoteResponse]]:
+        """Sends append entries request and handles response
+        :param member_id: id of the member to send the request to
+        :param sent_index: index of highest sent log
+        :param append_entries_request: the request to send
+        """
+        member_stub = self.member_stubs[member_id]
+        try:
+            return (
+                member_id,
+                member_stub.RequestVote(append_entries_request),
+            )
+        except grpc.RpcError as ex:
+            print(f"Failed to send RequestVote to member {member_id}: {ex}")
+            return None
+
+    def _handle_request_vote_response(
+        self,
+        election_data: ElectionData,
+        member_id: int,
+        response: raft_pb2.RequestVoteResponse,
+    ) -> None:
+        """Returns true if the vote was provided"""
+        if response.term > election_data.election_term:
+            with self._lock:
+                self._set_new_term(response.term, None)
+            return
+
+        if response.vote_granted and member_id not in election_data.voters:
+            election_data.voters.add(member_id)
+            election_data.votes_received += 1
+
+    # endregion Candidate
+
+    # region Leader
+
+    def _initialize_leader(self) -> None:
+        # TODO: initialize indexes in leader_state
+        pass
+
+    def _send_append_entries_to_followers(self, current_term: int) -> None:
+        with ThreadPoolExecutor(len(self.leader_state.next_index)) as t_pool:
+            while self._role == "L":
+                curr_time = time.perf_counter()
+                heartbeat_interval_sec = 0.1
+                next_time = curr_time + heartbeat_interval_sec
+
+                futures = []
+                requests = self._create_append_entries_requests(current_term)
+                for member_id, sent_index, request in requests:
+                    futures.append(
+                        t_pool.submit(
+                            self._send_append_entries_request,
+                            member_id,
+                            sent_index,
+                            request,
+                        )
+                    )
+
+                for future in as_completed(futures):
+                    if result := future.result():
+                        member_id, sent_index, response = result
+                        self._handle_append_entries_response(
+                            member_id, sent_index, response
+                        )
+
+                with self._lock:
+                    self._calculate_commit_index()
+
+                time.sleep(max((next_time - time.perf_counter()), 0))
+
+    def _create_append_entries_requests(
+        self, current_term: int
+    ) -> List[Tuple[int, int, raft_pb2.AppendEntriesRequest]]:
+        with self._lock:
+            requests: List[Tuple[int, int, raft_pb2.AppendEntriesRequest]] = []
+            for member_id, next_index in self.leader_state.next_index.items():
+                if member_id == self.id:
+                    continue
+
+                append_entries_request = self._create_append_entries_request(
+                    current_term, next_index
+                )
+                sent_index = next_index + len(append_entries_request.entries) - 1
+                requests.append((member_id, sent_index, append_entries_request))
+            return requests
+
+    def _create_append_entries_request(
         self, term: int, next_index: int
     ) -> raft_pb2.AppendEntriesRequest:
         prev_log_index = next_index - 1
-        async with self.log_lock:
-            prev_log_term = self.state.get_log_term_at(prev_log_index)
-            entries = self.state.get_logs_starting_from(next_index, max=10)
+        prev_log_term = self.state.get_log_term_at(prev_log_index)
+        entries = self.state.get_logs_starting_from(next_index, max=10)
 
         return raft_pb2.AppendEntriesRequest(
             term=term,
@@ -268,42 +390,43 @@ class Member(raft_pb2_grpc.RaftServicer):
             leader_commit=self.commit_index,
         )
 
-    async def send_append_entries_and_handle_response(
+    def _send_append_entries_request(
         self,
         member_id: int,
         sent_index: int,
         append_entries_request: raft_pb2.AppendEntriesRequest,
-    ) -> None:
-        """Sends append entries request and handles reponse
+    ) -> Optional[Tuple[int, int, raft_pb2.AppendEntriesResponse]]:
+        """Sends append entries request and handles response
         :param member_id: id of the member to send the request to
         :param sent_index: index of highest sent log
         :param append_entries_request: the request to send
         """
         member_stub = self.member_stubs[member_id]
         try:
-            response = await member_stub.AppendEntries(append_entries_request)
+            return (
+                member_id,
+                sent_index,
+                member_stub.AppendEntries(append_entries_request),
+            )
         except grpc.RpcError as ex:
-            print(f"Failed to send heartbeat to member {member_id}: {ex}")
-            return
+            print(f"Failed to send AppendEntries to member {member_id}: {ex}")
+            return None
 
-        await self.handle_append_entries_response(member_id, sent_index, response)
-
-    async def handle_append_entries_response(
+    def _handle_append_entries_response(
         self,
         member_id: int,
         sent_index: int,
         response: raft_pb2.AppendEntriesResponse,
     ) -> None:
-        """Should only be run under term_lock"""
-        async with self.term_lock:
+        """Used by leader"""
+        with self._lock:
             if response.term > self.state.current_term:
-                self.set_new_term(response.term, None)
+                self._set_new_term(response.term, None)
                 return
 
-        if not self._is_leader.is_set():
-            return
+            if self._role != "L":
+                return
 
-        async with self.index_lock:
             # handle old responses
             if sent_index < self.leader_state.match_index[member_id]:
                 return
@@ -321,29 +444,181 @@ class Member(raft_pb2_grpc.RaftServicer):
                     self.leader_state.next_index[member_id] - 1, 1
                 )
 
-    async def calculate_commit_index(self) -> None:
-        async with self.index_lock:
+    def _calculate_commit_index(self) -> None:
+        with self._lock:
             # Find the highest log index replicated on a majority of servers
             sorted_match_indexes = sorted(
                 self.leader_state.match_index.values(), reverse=True
             )
-            new_commit_index = sorted_match_indexes[self.get_majority_num() - 1]
+            new_commit_index = sorted_match_indexes[self._get_quorum_val() - 1]
             if new_commit_index > self.commit_index:
                 self.commit_index = new_commit_index
 
-    def set_new_term(
+    # endregion Leader
+
+    # region state loops
+
+    def start_raft_processing(self) -> None:
+        # TODO Run self._base_loop it's own thread; 'RAFT processor'
+        pass
+
+    def stop_raft_processing(self) -> None:
+        # TODO Stop the 'RAFT processor' thread
+        pass
+
+    def _base_loop(self) -> None:
+        while True:  # might want to add some condition here
+            if self._role == "F":
+                self._follower_loop()
+            elif self._role == "C":
+                self._candidate_loop()
+            elif self._role == "F":
+                self._leader_loop()
+            else:
+                raise ValueError(f"Invalid role: {self._role}")
+
+    def _handle_default_actions(self, event: threading.Event, action: Any) -> None:
+        if isinstance(action, raft_pb2.AppendEntriesRequest):
+            append_res = self._handle_append_entries_request(action)
+            self._event_to_append_response[event] = append_res
+            event.set()
+
+        elif isinstance(action, raft_pb2.RequestVoteRequest):
+            vote_res = self._handle_request_vote_request(action)
+            self._event_to_vote_response[event] = vote_res
+            event.set()
+
+        else:
+            raise TypeError(f"Invalid action provided: '{action}'")
+
+    def _follower_loop(self) -> None:
+        while self._role == "F":
+            try:
+                # adding timeout here just in case
+                event, action = self._req_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+
+            if event is None:
+                if isinstance(action, TimeoutError):
+                    # start election process
+                    self._role = "C"
+                    return
+
+                raise TypeError(f"Invalid action provided: {action}")
+
+            if isinstance(action, str):
+                # TODO: redirect to leader
+                # self._event_to_append_log_status[event]
+                # event.set()
+                raise NotImplementedError()
+
+            self._handle_default_actions(event, action)
+
+    def _candidate_loop(self) -> None:
+        self._reset_timeout()
+
+        self._run_election()
+        # if we got enough votes and became leader, exit, otherwise do loop below
+        if self._role == "L":
+            return
+
+        while self._role == "C":
+            try:
+                # adding timeout here just in case
+                event, action = self._req_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+
+            if event is None:
+                if isinstance(action, TimeoutError):
+                    # restart election process
+                    return
+
+                raise TypeError(f"Invalid action provided: {action}")
+
+            if isinstance(action, str):
+                # TODO: ? probably just respond as 'busy'
+                # event.set()
+                raise NotImplementedError()
+
+            self._handle_default_actions(event, action)
+
+    def _leader_loop(self) -> None:
+        self._cancel_timeout()
+
+        while self._role == "L":
+            try:
+                # adding timeout here just in case
+                event, action = self._req_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+
+            if event is None:
+                raise TypeError(f"Invalid action provided: {action}")
+
+            if isinstance(action, str):
+                # TODO: process action -- append to log;
+                # need to wait till the action gets committed before setting the event,
+                # but we don't want to sit here and block everything while that happens.
+                # will need to keep the event somewhere until the action is committed, and then set it
+                raise NotImplementedError()
+
+            self._handle_default_actions(event, action)
+
+    # endregion
+
+    # region Misc
+
+    def _create_member_stubs(self) -> None:
+        for member_id, member_address in self.members.items():
+            if self.member_stubs.get(member_id) is not None:
+                continue
+
+            channel = self.member_channels.get(member_id)
+            if channel is None:
+                channel = grpc.insecure_channel(member_address)
+                self.member_channels[member_id] = channel
+
+            self.member_stubs[member_id] = raft_pb2_grpc.RaftStub(channel)
+
+    def _close_member_stubs(self) -> None:
+        for member_channel in self.member_channels.values():
+            member_channel.close()
+
+        self.member_channels.clear()
+        self.member_stubs.clear()
+
+    def _reset_timeout(self) -> None:
+        self._cancel_timeout()
+
+        election_timeout_ms: int = random.randint(
+            self.timeout_min_ms, self.timeout_max_ms
+        )
+        self.timeout_task = threading.Timer(
+            election_timeout_ms * 1000, self._timeout_handler
+        )
+        self.timeout_task.start()
+
+    def _cancel_timeout(self) -> None:
+        if self.timeout_task:
+            self.timeout_task.cancel()
+
+    def _timeout_handler(self) -> None:
+        self._req_queue.put((None, TimeoutError()))
+
+    def _set_new_term(
         self, new_term: int, voted_for: Optional[int], leader_id: Optional[int] = None
     ) -> None:
-        """Starts a new term by updating term, voted_for, and updating leader_id. Should only be run under term_lock"""
         if new_term > self.state.current_term:
             self.state.set_new_term(new_term, voted_for)
-            self._is_leader.clear()
+            self._role = "C" if voted_for == self.id else "F"
             self.leader_id = leader_id
 
-    def get_majority_num(self) -> int:
+    def _get_quorum_val(self) -> int:
         """The number of votes required to reach majority"""
         # TODO
-        return 3
+        return math.floor(len(self.members) / 2) + 1
 
     def temp_all_server_rules(self) -> None:
         # TODO: When should we run this?:
@@ -355,6 +630,11 @@ class Member(raft_pb2_grpc.RaftServicer):
             # commit log / run in state machine
             # need some sort of call back provided by state machine to run the command
 
+    def _set_voted_for(self, candidate_id: int):
+        self.state.set_voted_for(candidate_id)
+
+    # endregion Misc
+
 
 MEMBER_ID_TO_ADDRESS: Dict[int, str] = {
     0: "[::]:50050",
@@ -363,24 +643,3 @@ MEMBER_ID_TO_ADDRESS: Dict[int, str] = {
     3: "[::]:50053",
     4: "[::]:50054",
 }
-
-
-async def example_start(member_id: int, members: Dict[int, str]) -> None:
-    server = grpc.aio.server(ThreadPoolExecutor(max_workers=10))
-    state = PersistentState(log_file_path=f"raft_state.{member_id}")
-    mem = Member(member_id, state, members)
-    raft_pb2_grpc.add_RaftServicer_to_server(mem, server)
-    server.add_insecure_port(members[member_id])
-    await server.start()
-    try:
-        await server.wait_for_termination()
-    except KeyboardInterrupt:
-        pass
-
-    await server.stop(10)
-
-
-try:
-    asyncio.run(example_start(0, MEMBER_ID_TO_ADDRESS))
-except KeyboardInterrupt:
-    print("server stopped")
